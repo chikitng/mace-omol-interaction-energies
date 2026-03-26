@@ -20,18 +20,20 @@ PLREX_BASE = "https://raw.githubusercontent.com/Honza-R/PL-REX/main"
 
 NUM_CONFS = 10
 RANDOM_SEED = 2026
-# PRUNE_RMS = 0.5
 PRUNE_RMS = -1
 
 BASE_DIR = Path(PDB_ID)
 INPUT_DIR = BASE_DIR / "input"
 CONF_DIR = BASE_DIR / "conformers"
-MOPAC_DIR = BASE_DIR / "mopac"
+MOPAC_VAC_DIR = BASE_DIR / "mopac_vacuum"
+MOPAC_WATER_DIR = BASE_DIR / "mopac_water"
 RESULTS_DIR = BASE_DIR / "results"
 
 INPUT_SDF = INPUT_DIR / "ligand.sdf"
 CONF_SDF = CONF_DIR / "ligand_10confs.sdf"
-RESULTS_CSV = RESULTS_DIR / "vacuum_results.csv"
+
+VAC_RESULTS_CSV = RESULTS_DIR / "vacuum_results.csv"
+WATER_RESULTS_CSV = RESULTS_DIR / "water_results.csv"
 
 
 # =========================
@@ -40,7 +42,8 @@ RESULTS_CSV = RESULTS_DIR / "vacuum_results.csv"
 def setup_dirs():
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     CONF_DIR.mkdir(parents=True, exist_ok=True)
-    MOPAC_DIR.mkdir(parents=True, exist_ok=True)
+    MOPAC_VAC_DIR.mkdir(parents=True, exist_ok=True)
+    MOPAC_WATER_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -55,7 +58,7 @@ def download_ligand():
 
 
 # =========================
-# Read charge
+# Charge
 # =========================
 def get_charge(mol: Chem.Mol) -> int:
     if mol.HasProp("charge"):
@@ -106,16 +109,19 @@ def generate_conformers() -> int:
 
 
 # =========================
-# Write MOPAC input files
-# Header:
-# PM7 CHARGE=0
-#
-# Vacuum
+# MOPAC keywords
 # =========================
-def build_mopac_keywords(charge: int) -> str:
+def build_vacuum_keywords(charge: int) -> str:
     return f"PM7 CHARGE={charge}"
 
 
+def build_water_keywords(charge: int) -> str:
+    return f"PM7 CHARGE={charge} EPS=78.4"
+
+
+# =========================
+# RDKit mol -> MOPAC block
+# =========================
 def mol_to_mopac_xyz_block(mol: Chem.Mol, conf_id: int = 0) -> str:
     conf = mol.GetConformer(conf_id)
     lines = []
@@ -127,9 +133,12 @@ def mol_to_mopac_xyz_block(mol: Chem.Mol, conf_id: int = 0) -> str:
     return "\n".join(lines)
 
 
-def write_mopac_inputs(charge: int) -> list[Path]:
+# =========================
+# Write vacuum MOPAC inputs
+# =========================
+def write_vacuum_mopac_inputs(charge: int) -> list[Path]:
     mols = [m for m in Chem.SDMolSupplier(str(CONF_SDF), removeHs=False) if m is not None]
-    keywords = build_mopac_keywords(charge)
+    keywords = build_vacuum_keywords(charge)
 
     mop_files = []
     for i, mol in enumerate(mols, start=1):
@@ -143,16 +152,16 @@ def write_mopac_inputs(charge: int) -> list[Path]:
             f"\n"
         )
 
-        mop_path = MOPAC_DIR / f"conf_{i:02d}.mop"
+        mop_path = MOPAC_VAC_DIR / f"conf_{i:02d}.mop"
         mop_path.write_text(text)
         mop_files.append(mop_path)
 
-    print(f"Wrote {len(mop_files)} MOPAC input files -> {MOPAC_DIR}")
+    print(f"Wrote {len(mop_files)} vacuum MOPAC input files -> {MOPAC_VAC_DIR}")
     return mop_files
 
 
 # =========================
-# Run MOPAC
+# Find / run MOPAC
 # =========================
 def find_mopac_executable() -> str:
     for exe in ["mopac", "MOPAC2016.exe", "MOPAC.exe"]:
@@ -162,17 +171,102 @@ def find_mopac_executable() -> str:
     raise FileNotFoundError("Could not find MOPAC executable in PATH.")
 
 
-def run_mopac_jobs(mop_files: list[Path]):
+def run_mopac_jobs(mop_files: list[Path], workdir: Path):
     mopac_exe = find_mopac_executable()
     print(f"Using MOPAC executable: {mopac_exe}")
 
     for mop_file in mop_files:
-        print(f"Running {mop_file.name}")
+        print(f"Running {mop_file.name} in {workdir}")
         subprocess.run(
             [mopac_exe, mop_file.name],
-            cwd=str(MOPAC_DIR),
+            cwd=str(workdir),
             check=True
         )
+
+
+# =========================
+# Extract final Cartesian block from MOPAC .out
+# =========================
+def is_float(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def extract_final_block(out_file: Path) -> str:
+    text = out_file.read_text(errors="ignore")
+
+    blocks = re.split(r"CARTESIAN COORDINATES", text)
+    if len(blocks) < 2:
+        return ""
+
+    final_block = blocks[-1]
+    extracted_lines = []
+
+    for line in final_block.splitlines():
+        parts = line.split()
+
+        if (
+            len(parts) >= 5
+            and parts[0].isdigit()
+            and is_float(parts[2])
+            and is_float(parts[3])
+            and is_float(parts[4])
+        ):
+            extracted_lines.append(line)
+        elif extracted_lines:
+            break
+
+    return "\n".join(extracted_lines)
+
+
+def cartesian_block_to_mopac_geometry(cart_block: str) -> str:
+    geometry_lines = []
+
+    for line in cart_block.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].isdigit():
+            atom = parts[1]
+            x, y, z = parts[2:5]
+            geometry_lines.append(f"{atom:<2} {x:>15} {y:>15} {z:>15}")
+
+    return "\n".join(geometry_lines)
+
+
+# =========================
+# Write water MOPAC input files from vacuum .out
+# =========================
+def write_water_mopac_inputs_from_outputs(charge: int) -> list[Path]:
+    keywords = build_water_keywords(charge)
+    water_mop_files = []
+
+    for out_file in sorted(MOPAC_VAC_DIR.glob("conf_*.out")):
+        final_cart_block = extract_final_block(out_file)
+
+        if not final_cart_block.strip():
+            print(f"Warning: no final Cartesian coordinates found in {out_file.name}")
+            continue
+
+        coord_txt = MOPAC_WATER_DIR / f"{out_file.stem}_final_cartesian_coordinates.txt"
+        coord_txt.write_text(final_cart_block + "\n")
+
+        mopac_geometry = cartesian_block_to_mopac_geometry(final_cart_block)
+
+        water_mop = MOPAC_WATER_DIR / f"{out_file.stem}_water.mop"
+        with open(water_mop, "w") as f:
+            f.write(f"{keywords}\n")
+            f.write("\n")
+            f.write("\n")
+            f.write(mopac_geometry)
+            f.write("\n")
+
+        water_mop_files.append(water_mop)
+        print(f"Wrote water input: {water_mop.name}")
+
+    print(f"Wrote {len(water_mop_files)} water MOPAC input files -> {MOPAC_WATER_DIR}")
+    return water_mop_files
 
 
 # =========================
@@ -217,26 +311,26 @@ def extract_status(text: str) -> str:
     return "unknown"
 
 
-def parse_outputs():
+def parse_outputs(output_dir: Path, csv_path: Path):
     rows = []
 
-    for out_file in sorted(MOPAC_DIR.glob("conf_*.out")):
+    for out_file in sorted(output_dir.glob("*.out")):
         text = out_file.read_text(errors="ignore")
         status = extract_status(text)
         hof = extract_heat_of_formation(text)
         total_energy = extract_total_energy(text)
         rows.append([out_file.name, status, hof, total_energy])
 
-    with open(RESULTS_CSV, "w", newline="") as f:
+    with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["file", "status", "heat_of_formation", "total_energy"])
         writer.writerows(rows)
 
-    print(f"Results written to: {RESULTS_CSV}")
+    print(f"Results written to: {csv_path}")
     print("\nSummary:")
     for row in rows:
         print(
-            f"{row[0]:15s} status={row[1]:10s} "
+            f"{row[0]:20s} status={row[1]:15s} "
             f"heat_of_formation={row[2]} total_energy={row[3]}"
         )
 
@@ -246,12 +340,36 @@ def parse_outputs():
 # =========================
 def main():
     print(f"Running in current directory: {Path.cwd()}")
+
     setup_dirs()
+
+    # Step 1: download ligand
     download_ligand()
+
+    # Step 2: generate conformers
     charge = generate_conformers()
-    mop_files = write_mopac_inputs(charge)
-    run_mopac_jobs(mop_files)
-    parse_outputs()
+
+    # Step 3: write vacuum inputs
+    vacuum_mop_files = write_vacuum_mopac_inputs(charge)
+
+    # Step 4: run vacuum MOPAC
+    run_mopac_jobs(vacuum_mop_files, MOPAC_VAC_DIR)
+
+    # Step 5: parse vacuum results
+    parse_outputs(MOPAC_VAC_DIR, VAC_RESULTS_CSV)
+
+    # Step 6: write water inputs from vacuum outputs
+    water_mop_files = write_water_mopac_inputs_from_outputs(charge)
+
+    if not water_mop_files:
+        print("No water MOPAC files were generated.")
+        return
+
+    # Step 7: run water MOPAC
+    run_mopac_jobs(water_mop_files, MOPAC_WATER_DIR)
+
+    # Step 8: parse water results
+    parse_outputs(MOPAC_WATER_DIR, WATER_RESULTS_CSV)
 
 
 if __name__ == "__main__":
