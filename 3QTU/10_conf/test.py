@@ -111,12 +111,12 @@ def generate_conformers() -> int:
 # =========================
 # MOPAC keywords
 # =========================
-def build_vacuum_keywords(charge: int) -> str:
-    return f"PM7 CHARGE={charge}"
-
-
-def build_water_keywords(charge: int) -> str:
+def build_water_opt_keywords(charge: int) -> str:
     return f"PM7 CHARGE={charge} EPS=78.4"
+
+
+def build_vacuum_sp_keywords(charge: int) -> str:
+    return f"PM7 CHARGE={charge} 1SCF"
 
 
 # =========================
@@ -134,11 +134,11 @@ def mol_to_mopac_xyz_block(mol: Chem.Mol, conf_id: int = 0) -> str:
 
 
 # =========================
-# Write vacuum MOPAC inputs
+# Write water optimisation MOPAC inputs
 # =========================
-def write_vacuum_mopac_inputs(charge: int) -> list[Path]:
+def write_water_optimization_inputs(charge: int) -> list[Path]:
     mols = [m for m in Chem.SDMolSupplier(str(CONF_SDF), removeHs=False) if m is not None]
-    keywords = build_vacuum_keywords(charge)
+    keywords = build_water_opt_keywords(charge)
 
     mop_files = []
     for i, mol in enumerate(mols, start=1):
@@ -152,11 +152,11 @@ def write_vacuum_mopac_inputs(charge: int) -> list[Path]:
             f"\n"
         )
 
-        mop_path = MOPAC_VAC_DIR / f"conf_{i:02d}.mop"
+        mop_path = MOPAC_WATER_DIR / f"conf_{i:02d}_water_opt.mop"
         mop_path.write_text(text)
         mop_files.append(mop_path)
 
-    print(f"Wrote {len(mop_files)} vacuum MOPAC input files -> {MOPAC_VAC_DIR}")
+    print(f"Wrote {len(mop_files)} water optimisation MOPAC input files -> {MOPAC_WATER_DIR}")
     return mop_files
 
 
@@ -222,7 +222,7 @@ def extract_final_block(out_file: Path) -> str:
     return "\n".join(extracted_lines)
 
 
-def cartesian_block_to_mopac_geometry(cart_block: str) -> str:
+def cartesian_block_to_mopac_geometry(cart_block: str, optimize_flags: int = 0) -> str:
     geometry_lines = []
 
     for line in cart_block.splitlines():
@@ -230,43 +230,47 @@ def cartesian_block_to_mopac_geometry(cart_block: str) -> str:
         if len(parts) >= 5 and parts[0].isdigit():
             atom = parts[1]
             x, y, z = parts[2:5]
-            geometry_lines.append(f"{atom:<2} {x:>15} {y:>15} {z:>15}")
+
+            geometry_lines.append(
+                f"{atom:<2} {x} {optimize_flags} {y} {optimize_flags} {z} {optimize_flags}"
+            )
 
     return "\n".join(geometry_lines)
 
 
 # =========================
-# Write water MOPAC input files from vacuum .out
+# Write vacuum single-point inputs from water outputs
 # =========================
-def write_water_mopac_inputs_from_outputs(charge: int) -> list[Path]:
-    keywords = build_water_keywords(charge)
-    water_mop_files = []
+def write_vacuum_singlepoint_inputs_from_water_outputs(charge: int) -> list[Path]:
+    keywords = build_vacuum_sp_keywords(charge)
+    vacuum_mop_files = []
 
-    for out_file in sorted(MOPAC_VAC_DIR.glob("conf_*.out")):
+    for out_file in sorted(MOPAC_WATER_DIR.glob("conf_*_water_opt.out")):
         final_cart_block = extract_final_block(out_file)
 
         if not final_cart_block.strip():
             print(f"Warning: no final Cartesian coordinates found in {out_file.name}")
             continue
 
-        coord_txt = MOPAC_WATER_DIR / f"{out_file.stem}_final_cartesian_coordinates.txt"
+        coord_txt = MOPAC_VAC_DIR / f"{out_file.stem}_final_cartesian_coordinates.txt"
         coord_txt.write_text(final_cart_block + "\n")
 
-        mopac_geometry = cartesian_block_to_mopac_geometry(final_cart_block)
+        # Use fixed coordinates for single-point
+        mopac_geometry = cartesian_block_to_mopac_geometry(final_cart_block, optimize_flags=0)
 
-        water_mop = MOPAC_WATER_DIR / f"{out_file.stem}_water.mop"
-        with open(water_mop, "w") as f:
+        vacuum_mop = MOPAC_VAC_DIR / f"{out_file.stem}_vacuum_sp.mop"
+        with open(vacuum_mop, "w") as f:
             f.write(f"{keywords}\n")
             f.write("\n")
             f.write("\n")
             f.write(mopac_geometry)
             f.write("\n")
 
-        water_mop_files.append(water_mop)
-        print(f"Wrote water input: {water_mop.name}")
+        vacuum_mop_files.append(vacuum_mop)
+        print(f"Wrote vacuum single-point input: {vacuum_mop.name}")
 
-    print(f"Wrote {len(water_mop_files)} water MOPAC input files -> {MOPAC_WATER_DIR}")
-    return water_mop_files
+    print(f"Wrote {len(vacuum_mop_files)} vacuum single-point MOPAC input files -> {MOPAC_VAC_DIR}")
+    return vacuum_mop_files
 
 
 # =========================
@@ -298,7 +302,7 @@ def extract_total_energy(text: str):
 
 def extract_status(text: str) -> str:
     low = text.lower()
-    if "job ended normally" in low or "== mopac done ==" in low:
+    if "job ended normally" in low or "== mopac done ==" in low or "mopac done" in low:
         return "ok"
     if "unable to achieve self-consistence" in low:
         return "scf_failed"
@@ -330,7 +334,7 @@ def parse_outputs(output_dir: Path, csv_path: Path):
     print("\nSummary:")
     for row in rows:
         print(
-            f"{row[0]:20s} status={row[1]:15s} "
+            f"{row[0]:35s} status={row[1]:15s} "
             f"heat_of_formation={row[2]} total_energy={row[3]}"
         )
 
@@ -349,27 +353,27 @@ def main():
     # Step 2: generate conformers
     charge = generate_conformers()
 
-    # Step 3: write vacuum inputs
-    vacuum_mop_files = write_vacuum_mopac_inputs(charge)
+    # Step 3: write water optimisation inputs
+    water_mop_files = write_water_optimization_inputs(charge)
 
-    # Step 4: run vacuum MOPAC
-    run_mopac_jobs(vacuum_mop_files, MOPAC_VAC_DIR)
-
-    # Step 5: parse vacuum results
-    parse_outputs(MOPAC_VAC_DIR, VAC_RESULTS_CSV)
-
-    # Step 6: write water inputs from vacuum outputs
-    water_mop_files = write_water_mopac_inputs_from_outputs(charge)
-
-    if not water_mop_files:
-        print("No water MOPAC files were generated.")
-        return
-
-    # Step 7: run water MOPAC
+    # Step 4: run water MOPAC optimisation
     run_mopac_jobs(water_mop_files, MOPAC_WATER_DIR)
 
-    # Step 8: parse water results
+    # Step 5: parse water optimisation results
     parse_outputs(MOPAC_WATER_DIR, WATER_RESULTS_CSV)
+
+    # Step 6: write vacuum single-point inputs from water-optimised outputs
+    vacuum_mop_files = write_vacuum_singlepoint_inputs_from_water_outputs(charge)
+
+    if not vacuum_mop_files:
+        print("No vacuum single-point MOPAC files were generated.")
+        return
+
+    # Step 7: run vacuum single-point MOPAC
+    run_mopac_jobs(vacuum_mop_files, MOPAC_VAC_DIR)
+
+    # Step 8: parse vacuum single-point results
+    parse_outputs(MOPAC_VAC_DIR, VAC_RESULTS_CSV)
 
 
 if __name__ == "__main__":
